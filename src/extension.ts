@@ -49,6 +49,77 @@ async function getRunningModel(): Promise<string | null> {
 	}
 }
 
+async function stopModel(modelName: string): Promise<boolean> {
+	try {
+		await axios.post("http://localhost:11434/api/generate", {
+			model: modelName,
+			prompt: "",
+			stream: false,
+			options: { num_predict: 0 }  // 0 tokens = stop model
+		});
+		return true;
+	} catch {
+		// Try alternative method
+		try {
+			await axios.delete(`http://localhost:11434/api/delete/${modelName}`);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+}
+
+// Helper function to ensure the selected model is running
+async function ensureModelRunning(targetModel: string, showProgress: boolean = true): Promise<boolean> {
+	console.log(`[OllamaAutocoder] ensureModelRunning - target: ${targetModel}`);
+	const runningModel = await getRunningModel();
+	console.log(`[OllamaAutocoder] ensureModelRunning - running: ${runningModel}`);
+	
+	// If the target model is already running, do nothing
+	if (runningModel === targetModel) {
+		console.log(`[OllamaAutocoder] Model ${targetModel} is already running`);
+		return true;
+	}
+	
+	// Stop the current running model if any
+	if (runningModel) {
+		console.log(`[OllamaAutocoder] Stopping model: ${runningModel}`);
+		if (showProgress) {
+			vscode.window.showInformationMessage(`Stopping ${runningModel}...`);
+		}
+		const execAsync = promisify(cp.exec);
+		try {
+			await execAsync(`ollama stop ${runningModel}`);
+			console.log(`[OllamaAutocoder] Stopped model: ${runningModel}`);
+		} catch (stopErr: any) {
+			console.log(`[OllamaAutocoder] Stop warning: ${stopErr.message}`);
+		}
+		// Wait for model to fully unload
+		await new Promise(resolve => setTimeout(resolve, 2000));
+	}
+	
+	// Load the target model
+	if (showProgress) {
+		vscode.window.showInformationMessage(`Loading ${targetModel}...`);
+	}
+	try {
+		const response = await axios.post(apiEndpoint, {
+			model: targetModel,
+			prompt: 'test',
+			stream: false,
+			options: { num_predict: 1 }
+		}, { timeout: 60000 });
+		console.log(`[OllamaAutocoder] Loaded model: ${targetModel}, response:`, response.data);
+		return true;
+	} catch (err: any) {
+		console.error(`[OllamaAutocoder] Failed to load model: ${err.message}`);
+		if (err.response && err.response.data && err.response.data.error) {
+			console.error(`[OllamaAutocoder] Error details: ${err.response.data.error}`);
+		}
+		return false;
+	}
+}
+
 // Context memory functions
 function getContextFilePath(document: vscode.TextDocument): string | null {
 	if (!contextMemoryEnabled) return null;
@@ -87,11 +158,38 @@ function clearContext(document: vscode.TextDocument) {
 }
 
 function updateStatusBar() {
-	if (!statusBarItem) return;
-	statusBarItem.text = `\$(symbol-model) ${apiModel}`;
-	statusBarItem.command = "ollama-autocoder.selectModel";
-	statusBarItem.tooltip = "Click to select Ollama model";
-	statusBarItem.show();
+	const item = statusBarItem;
+	if (!item) return;
+	
+	// Get the currently running model
+	getRunningModel().then(runningModel => {
+		if (!statusBarItem) return;
+		const displayModel = runningModel || apiModel;
+		const statusText = runningModel ? `(Running)` : `(Not running)`;
+		statusBarItem.text = `\$(symbol-model) ${displayModel}`;
+		statusBarItem.command = "ollama-autocoder.selectModel";
+		statusBarItem.tooltip = `Current: ${displayModel}\nStatus: ${statusText}\nClick to select Ollama model`;
+		statusBarItem.show();
+	}).catch(() => {
+		if (!statusBarItem) return;
+		// Fallback to configured model
+		statusBarItem.text = `\$(symbol-model) ${apiModel}`;
+		statusBarItem.command = "ollama-autocoder.selectModel";
+		statusBarItem.tooltip = "Click to select Ollama model";
+		statusBarItem.show();
+	});
+}
+
+// Auto-update status bar every 5 seconds to keep in sync with running model
+let statusBarUpdateInterval: NodeJS.Timeout | undefined;
+
+function startStatusBarSync() {
+	if (statusBarUpdateInterval) {
+		clearInterval(statusBarUpdateInterval);
+	}
+	statusBarUpdateInterval = setInterval(() => {
+		updateStatusBar();
+	}, 5000);
 }
 
 function updateVSConfig() {
@@ -167,6 +265,19 @@ async function autocompleteCommand(textEditor: vscode.TextEditor, cancellationTo
 		},
 		async (progress, progressCancellationToken) => {
 			try {
+				progress.report({ message: "Checking model..." });
+
+				// Ensure the configured model is running
+				const runningModel = await getRunningModel();
+				if (runningModel !== apiModel) {
+					progress.report({ message: `Switching to ${apiModel}...` });
+					const success = await ensureModelRunning(apiModel, false);
+					if (!success) {
+						vscode.window.showErrorMessage(`Failed to load model ${apiModel}`);
+						return;
+					}
+				}
+
 				progress.report({ message: "Starting model..." });
 
 				let axiosCancelPost: () => void;
@@ -308,6 +419,16 @@ async function provideCompletionItems(document: vscode.TextDocument, position: v
 	// Set the label & inset text to a shortened, non-stream response
 	if (responsePreview) {
 		try {
+			// Ensure the configured model is running
+			const runningModel = await getRunningModel();
+			if (runningModel !== apiModel) {
+				const success = await ensureModelRunning(apiModel, false);
+				if (!success) {
+					vscode.window.showErrorMessage(`Failed to load model ${apiModel}`);
+					return [item];
+				}
+			}
+
 			let prompt = document.getText(new vscode.Range(document.lineAt(0).range.start, position));
 			prompt = prompt.substring(Math.max(0, prompt.length - promptWindowSize), prompt.length);
 			
@@ -479,35 +600,41 @@ function activate(context: vscode.ExtensionContext) {
 					placeHolder: "Select an Ollama model to switch to"
 				});
 				if (selected) {
+					// Refresh config to get latest value
+					updateVSConfig();
+					
+					console.log(`[OllamaAutocoder] Select model - apiModel: "${apiModel}", selected: "${selected}"`);
+					
 					// Check if selected model matches the configured model
 					if (apiModel === selected) {
-						vscode.window.showInformationMessage(`✅ ${selected} is already selected`);
+						// Still need to ensure it's running
+						const runningModel = await getRunningModel();
+						if (runningModel === selected) {
+							vscode.window.showInformationMessage(`✅ ${selected} is already selected and running`);
+							return;
+						}
+						// Model in config but not running, start it
+						vscode.window.showInformationMessage(`Starting ${selected}...`);
+						const success = await ensureModelRunning(selected, true);
+						if (success) {
+							vscode.window.showInformationMessage(`✅ ${selected} is now running`);
+						} else {
+							vscode.window.showErrorMessage(`Failed to start ${selected}`);
+						}
 						return;
 					}
 
-					// Check if selected model is already running
-					const runningModel = await getRunningModel();
-					if (runningModel === selected) {
-						// Model is running, just update config
-						await VSConfig.update("model", selected, vscode.ConfigurationTarget.Global);
-						vscode.window.showInformationMessage(`✅ Switched to ${selected} (already running)`);
-						updateVSConfig();
-						return;
-					}
-
-					// Update to global config and validate model
+					// Update to global config first
 					await VSConfig.update("model", selected, vscode.ConfigurationTarget.Global);
-					try {
-						const testEndpoint = apiEndpoint;
-						await axios.post(testEndpoint, {
-							model: selected,
-							prompt: 'test',
-							stream: false,
-							options: { num_predict: 1 }
-						}, { timeout: 30000 });
+					console.log(`[OllamaAutocoder] Config updated to ${selected}`);
+					
+					// Ensure the model is running (stop old, load new)
+					const success = await ensureModelRunning(selected, true);
+					
+					if (success) {
 						vscode.window.showInformationMessage(`✅ Switched to ${selected}`);
-					} catch (err: any) {
-						vscode.window.showWarningMessage(`⚠️ Switched to ${selected}, validation failed: ${err.message}`);
+					} else {
+						vscode.window.showErrorMessage(`❌ Failed to switch to ${selected}`);
 					}
 					updateVSConfig();
 				}
@@ -526,6 +653,7 @@ function activate(context: vscode.ExtensionContext) {
 			context.subscriptions.push(statusBarItem);
 
 		updateStatusBar();
+		startStatusBarSync();
 		} catch (err) {
 			handleError(err);
 		}
