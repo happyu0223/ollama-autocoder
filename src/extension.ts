@@ -3,6 +3,9 @@
 import * as vscode from "vscode";
 import axios from "axios";
 import * as cp from "child_process";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 import { promisify } from "util";
 
 let VSConfig: vscode.WorkspaceConfiguration;
@@ -19,6 +22,9 @@ let responsePreview: boolean | undefined;
 let responsePreviewMaxTokens: number;
 let responsePreviewDelay: number;
 let continueInline: boolean | undefined;
+let customPrompt: string;
+let contextMemoryEnabled: boolean;
+let contextFileExtensions: string;
 
 async function getOllamaModels(): Promise<string[]> {
 	try {
@@ -27,6 +33,56 @@ async function getOllamaModels(): Promise<string[]> {
 	} catch (error: any) {
 		vscode.window.showErrorMessage(`Failed to fetch Ollama models: ${error.message}`);
 		return [];
+	}
+}
+
+async function getRunningModel(): Promise<string | null> {
+	try {
+		const response = await axios.get("http://localhost:11434/api/ps");
+		const models = response.data.models;
+		if (models && models.length > 0) {
+			return models[0].name;
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
+// Context memory functions
+function getContextFilePath(document: vscode.TextDocument): string | null {
+	if (!contextMemoryEnabled) return null;
+	
+	const ext = path.extname(document.fileName).toLowerCase().replace('.', '');
+	const enabledExts = contextFileExtensions.split(',').map(e => e.trim().toLowerCase().replace('.', ''));
+	
+	if (!enabledExts.includes(ext)) return null;
+	
+	const contextDir = path.join(os.tmpdir(), 'ollama-autocoder-context');
+	if (!fs.existsSync(contextDir)) {
+		fs.mkdirSync(contextDir, { recursive: true });
+	}
+	
+	return path.join(contextDir, `context_${document.fileName.replace(/[\\/:*?"<>|]/g, '_')}.txt`);
+}
+
+function getContext(document: vscode.TextDocument): string {
+	const contextPath = getContextFilePath(document);
+	if (!contextPath || !fs.existsSync(contextPath)) return '';
+	return fs.readFileSync(contextPath, 'utf8');
+}
+
+function saveContext(document: vscode.TextDocument, context: string) {
+	const contextPath = getContextFilePath(document);
+	if (!contextPath) return;
+	fs.writeFileSync(contextPath, context, 'utf8');
+}
+
+function clearContext(document: vscode.TextDocument) {
+	const contextPath = getContextFilePath(document);
+	if (contextPath && fs.existsSync(contextPath)) {
+		fs.unlinkSync(contextPath);
+		console.log(`[OllamaAutocoder Debug] Context cleared for ${document.fileName}`);
 	}
 }
 
@@ -51,6 +107,9 @@ function updateVSConfig() {
 	responsePreviewDelay = VSConfig.get("preview delay") || 0;
 	continueInline = VSConfig.get("continue inline");
 	apiTemperature = VSConfig.get("temperature") || 0;
+	customPrompt = VSConfig.get("custom prompt") || "";
+	contextMemoryEnabled = VSConfig.get("context memory") || false;
+	contextFileExtensions = VSConfig.get("context file extension") || "txt,md";
 	updateStatusBar();
 }
 
@@ -121,7 +180,20 @@ async function autocompleteCommand(textEditor: vscode.TextEditor, cancellationTo
 					vscode.workspace.onDidCloseTextDocument(cancelPost);
 				});
 
-				const completeInput = messageHeaderSub(textEditor.document) + prompt;
+				// Add custom prompt if set
+				let header = messageHeaderSub(textEditor.document);
+				if (customPrompt) {
+					header = customPrompt + "\n\n" + header;
+				}
+				
+				// Add context memory if enabled
+				let context = "";
+				if (contextMemoryEnabled) {
+					context = getContext(document);
+				}
+				
+				const completeInput = header + (context ? context + "\n\n" : "") + prompt;
+				console.log(`[OllamaAutocoder Debug] autocompleteCommand - model: ${apiModel}, prompt length: ${prompt.length}, completeInput length: ${completeInput.length}, num_predict: ${numPredict}, context: ${context ? 'enabled' : 'disabled'}`);
 
 				// Make a request to the ollama.ai REST API
 				const response = await axios.post(apiEndpoint, {
@@ -238,9 +310,22 @@ async function provideCompletionItems(document: vscode.TextDocument, position: v
 		try {
 			let prompt = document.getText(new vscode.Range(document.lineAt(0).range.start, position));
 			prompt = prompt.substring(Math.max(0, prompt.length - promptWindowSize), prompt.length);
-			const completeInput = messageHeaderSub(document) + prompt;
 			
-			console.log(`[OllamaAutocoder Debug] provideCompletionItems - prompt length: ${prompt.length}, completeInput length: ${completeInput.length}, preview max tokens: ${responsePreviewMaxTokens}`);
+			// Add custom prompt if set
+			let header = messageHeaderSub(document);
+			if (customPrompt) {
+				header = customPrompt + "\n\n" + header;
+			}
+			
+			// Add context memory if enabled
+			let context = "";
+			if (contextMemoryEnabled) {
+				context = getContext(document);
+			}
+			
+			const completeInput = header + (context ? context + "\n\n" : "") + prompt;
+			
+			console.log(`[OllamaAutocoder Debug] provideCompletionItems - prompt length: ${prompt.length}, completeInput length: ${completeInput.length}, preview max tokens: ${responsePreviewMaxTokens}, context: ${context ? 'enabled' : 'disabled'}`);
 
 			const response_preview = await axios.post(apiEndpoint, {
 				model: apiModel, // Set via settings or "Ollama Autocoder: Select Ollama Model" command
@@ -264,8 +349,9 @@ async function provideCompletionItems(document: vscode.TextDocument, position: v
 			});
 
 			if (response_preview.data.response.trim() != "") { // default if empty
-				item.label = response_preview.data.response.trimStart(); // tended to add whitespace at the beginning
-				item.insertText = response_preview.data.response.trimStart();
+				const responseText = response_preview.data.response.trimStart();
+				item.label = responseText;
+				item.insertText = new vscode.SnippetString(responseText);
 			}
 		} catch (err: any) {
 			if (err.response && err.response.data) err.message = err.response.data.error;
@@ -324,6 +410,53 @@ function activate(context: vscode.ExtensionContext) {
 		}
 	)
 
+	// Register command for setting custom prompt
+	const setCustomPromptCommand = vscode.commands.registerCommand(
+		"ollama-autocoder.setCustomPrompt",
+		async () => {
+			const currentPrompt = customPrompt || "";
+			
+			// Show current prompt info if exists
+			if (currentPrompt) {
+				const action = await vscode.window.showInformationMessage(
+					`Current custom prompt: ${currentPrompt.substring(0, 50)}${currentPrompt.length > 50 ? '...' : ''}`,
+					{ modal: true },
+					"Modify",
+					"Clear",
+					"Cancel"
+				);
+				
+				if (action === "Clear") {
+					await VSConfig.update("custom prompt", "", vscode.ConfigurationTarget.Global);
+					updateVSConfig();
+					vscode.window.showInformationMessage(`✅ Custom prompt cleared`);
+					return;
+				}
+				
+				if (action === "Cancel" || action === undefined) {
+					return;
+				}
+			}
+			
+			const promptInput: string | undefined = await vscode.window.showInputBox({
+				password: false,
+				title: "Set Custom Prompt",
+				prompt: "Enter a custom prompt that will be prepended to all requests. Leave empty to disable.",
+				value: currentPrompt
+			});
+
+			if (promptInput !== undefined) {
+				await VSConfig.update("custom prompt", promptInput, vscode.ConfigurationTarget.Global);
+				updateVSConfig();
+				if (promptInput) {
+					vscode.window.showInformationMessage(`✅ Custom prompt updated`);
+				} else {
+					vscode.window.showInformationMessage(`✅ Custom prompt cleared`);
+				}
+			}
+		}
+	)
+
 	// Register a command for getting a completion from Ollama through command/keybind
 	const externalAutocompleteCommand = vscode.commands.registerTextEditorCommand(
 		"ollama-autocoder.autocomplete",
@@ -346,31 +479,37 @@ function activate(context: vscode.ExtensionContext) {
 					placeHolder: "Select an Ollama model to switch to"
 				});
 				if (selected) {
-					const scopes = [
-						{ label: 'Global (all projects)', target: vscode.ConfigurationTarget.Global },
-						{ label: 'Workspace (current project)', target: vscode.ConfigurationTarget.Workspace }
-					];
-					const scopePick = await vscode.window.showQuickPick(scopes, {
-						placeHolder: "Choose config scope",
-						canPickMany: false
-					});
-					if (scopePick) {
-						await VSConfig.update("model", selected, scopePick.target);
-						// Validate model
-						try {
-							const testEndpoint = apiEndpoint;
-							await axios.post(testEndpoint, {
-								model: selected,
-								prompt: 'test',
-								stream: false,
-								options: { num_predict: 1 }
-							}, { timeout: 30000 });
-							vscode.window.showInformationMessage(`✅ Switched to ${selected} (${scopePick.label})`);
-						} catch (err: any) {
-							vscode.window.showWarningMessage(`⚠️ Switched to ${selected} (${scopePick.label}), validation failed: ${err.message}`);
-						}
-						updateVSConfig();
+					// Check if selected model matches the configured model
+					if (apiModel === selected) {
+						vscode.window.showInformationMessage(`✅ ${selected} is already selected`);
+						return;
 					}
+
+					// Check if selected model is already running
+					const runningModel = await getRunningModel();
+					if (runningModel === selected) {
+						// Model is running, just update config
+						await VSConfig.update("model", selected, vscode.ConfigurationTarget.Global);
+						vscode.window.showInformationMessage(`✅ Switched to ${selected} (already running)`);
+						updateVSConfig();
+						return;
+					}
+
+					// Update to global config and validate model
+					await VSConfig.update("model", selected, vscode.ConfigurationTarget.Global);
+					try {
+						const testEndpoint = apiEndpoint;
+						await axios.post(testEndpoint, {
+							model: selected,
+							prompt: 'test',
+							stream: false,
+							options: { num_predict: 1 }
+						}, { timeout: 30000 });
+						vscode.window.showInformationMessage(`✅ Switched to ${selected}`);
+					} catch (err: any) {
+						vscode.window.showWarningMessage(`⚠️ Switched to ${selected}, validation failed: ${err.message}`);
+					}
+					updateVSConfig();
 				}
 			}
 		);
@@ -380,18 +519,27 @@ function activate(context: vscode.ExtensionContext) {
 			context.subscriptions.push(completionProvider);
 			context.subscriptions.push(externalAutocompleteCommand);
 			context.subscriptions.push(externalSetBearerCommand);
+			context.subscriptions.push(setCustomPromptCommand);
 			context.subscriptions.push(selectModelCommand);
 
 			statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, -10000);
 			context.subscriptions.push(statusBarItem);
 
-			updateStatusBar();
+		updateStatusBar();
 		} catch (err) {
 			handleError(err);
 		}
 
-		context.subscriptions.push(bearerSetChangeEvent);
+	// Register document close handler for context memory cleanup
+	if (contextMemoryEnabled) {
+		const closeHandler = vscode.workspace.onDidCloseTextDocument((doc) => {
+			clearContext(doc);
+		});
+		context.subscriptions.push(closeHandler);
 	}
+
+	context.subscriptions.push(bearerSetChangeEvent);
+}
 
 function deactivate() { }
 
