@@ -1,13 +1,1 @@
-# Ollama Model Dynamic Switching Task
-
-## Steps:
-- [x] 1. Update package.json: Add 'ollama-autocoder.selectModel' command and enhance model setting description.
-- [x] 2. Update src/extension.ts: Add child_process imports, getOllamaModels function, selectModel command registration and handler with QuickPick.
-- [x] 3. Compile the extension: npm run compile.
-- [x] 4. Reload VSCode window and test: Run command 'Ollama Autocoder: Select Ollama Model', pick a model, verify autocomplete uses it.
-
-**Task completed.**  
-
-npm install 安装依赖
-npm run compile  编译
-vsce package  打包
+# Ollama Model Selection Persistence Fix\n\n## Approved Plan Steps\n\n1. [ ] Add scope choice (Global/Workspace) to selectModelCommand in src/extension.ts\n2. [ ] Add model validation after switch (test API call)\n3. [ ] Add status bar item showing current model, clickable to select\n4. [ ] Update updateVSConfig to refresh status bar\n5. [ ] Compile with `npm run compile`\n6. [ ] Test: Switch models, verify persistence/status bar/autocomplete\n7. [ ] Mark complete & attempt_completion\n\n**Status: Ready for implementation after user approval.**\n

@@ -6,6 +6,7 @@ import * as cp from "child_process";
 import { promisify } from "util";
 
 let VSConfig: vscode.WorkspaceConfiguration;
+let statusBarItem: vscode.StatusBarItem | undefined;
 let apiEndpoint: string;
 let apiBearerToken: string;
 let apiModel: string;
@@ -21,14 +22,20 @@ let continueInline: boolean | undefined;
 
 async function getOllamaModels(): Promise<string[]> {
 	try {
-		const execAsync = promisify(cp.exec);
-		const { stdout } = await execAsync("ollama list");
-		const lines = stdout.trim().split("\n").slice(1); // Skip header
-		return lines.map(line => line.split(/\s+/)[0].trim()).filter(Boolean);
+		const response = await axios.get("http://localhost:11434/api/tags");
+		return response.data.models.map((m: any) => m.name);
 	} catch (error: any) {
 		vscode.window.showErrorMessage(`Failed to fetch Ollama models: ${error.message}`);
 		return [];
 	}
+}
+
+function updateStatusBar() {
+	if (!statusBarItem) return;
+	statusBarItem.text = `\$(symbol-model) ${apiModel}`;
+	statusBarItem.command = "ollama-autocoder.selectModel";
+	statusBarItem.tooltip = "Click to select Ollama model";
+	statusBarItem.show();
 }
 
 function updateVSConfig() {
@@ -41,9 +48,10 @@ function updateVSConfig() {
 	completionKeys = VSConfig.get("completion keys") || " ";
 	responsePreview = VSConfig.get("response preview");
 	responsePreviewMaxTokens = VSConfig.get("preview max tokens") || 0;
-	responsePreviewDelay = VSConfig.get("preview delay") || 0; // Must be || 0 instead of || [default] because of truthy
+	responsePreviewDelay = VSConfig.get("preview delay") || 0;
 	continueInline = VSConfig.get("continue inline");
 	apiTemperature = VSConfig.get("temperature") || 0;
+	updateStatusBar();
 }
 
 updateVSConfig();
@@ -53,10 +61,16 @@ vscode.workspace.onDidChangeConfiguration(updateVSConfig);
 
 // Give model additional information
 function messageHeaderSub(document: vscode.TextDocument) {
-	const sub = apiMessageHeader
-		.replace("{LANG}", document.languageId)
+	const lang = document.languageId;
+	let header = apiMessageHeader;
+	if (lang === 'csharp') {
+		header = VSConfig.get("csharpHeader") || header;
+	}
+	const sub = header
+		.replace("{LANG}", lang)
 		.replace("{FILE_NAME}", document.fileName)
 		.replace("{PROJECT_NAME}", vscode.workspace.name || "Untitled");
+	console.log(`[OllamaAutocoder Debug] Lang: ${lang}, Header preview: ${sub.substring(0, 100)}...`);
 	return sub;
 }
 
@@ -142,36 +156,41 @@ async function autocompleteCommand(textEditor: vscode.TextEditor, cancellationTo
 						return;
 					}
 
-					// Get a completion from the response
-					const completion: string = JSON.parse(d.toString()).response;
-					// lastToken = completion;
+					try {
+						// Get a completion from the response
+						const completion: string = JSON.parse(d.toString()).response;
+						console.log(`[OllamaAutocoder Debug] Chunk received: ${completion.length > 50 ? completion.substring(0, 50) + '...' : completion}`);
+						// lastToken = completion;
 
-					if (completion === "") {
-						return;
+						if (completion === "") {
+							return;
+						}
+
+						//complete edit for token
+						const edit = new vscode.WorkspaceEdit();
+						edit.insert(document.uri, currentPosition, completion);
+						await vscode.workspace.applyEdit(edit);
+
+						// Move the cursor to the end of the completion
+						const completionLines = completion.split("\n");
+						const newPosition = new vscode.Position(
+							currentPosition.line + completionLines.length - 1,
+							(completionLines.length > 1 ? 0 : currentPosition.character) + completionLines[completionLines.length - 1].length
+						);
+						const newSelection = new vscode.Selection(
+							position,
+							newPosition
+						);
+						currentPosition = newPosition;
+
+						// completion bar
+						progress.report({ message: "Generating...", increment: 1 / (numPredict / 100) });
+
+						// move cursor
+						textEditor.selection = newSelection;
+					} catch (parseErr) {
+						console.log(`[OllamaAutocoder Debug] Parse error on chunk: ${d.toString().substring(0, 100)}`);
 					}
-
-					//complete edit for token
-					const edit = new vscode.WorkspaceEdit();
-					edit.insert(document.uri, currentPosition, completion);
-					await vscode.workspace.applyEdit(edit);
-
-					// Move the cursor to the end of the completion
-					const completionLines = completion.split("\n");
-					const newPosition = new vscode.Position(
-						currentPosition.line + completionLines.length - 1,
-						(completionLines.length > 1 ? 0 : currentPosition.character) + completionLines[completionLines.length - 1].length
-					);
-					const newSelection = new vscode.Selection(
-						position,
-						newPosition
-					);
-					currentPosition = newPosition;
-
-					// completion bar
-					progress.report({ message: "Generating...", increment: 1 / (numPredict / 100) });
-
-					// move cursor
-					textEditor.selection = newSelection;
 				});
 
 				// Keep cancel window available
@@ -220,6 +239,8 @@ async function provideCompletionItems(document: vscode.TextDocument, position: v
 			let prompt = document.getText(new vscode.Range(document.lineAt(0).range.start, position));
 			prompt = prompt.substring(Math.max(0, prompt.length - promptWindowSize), prompt.length);
 			const completeInput = messageHeaderSub(document) + prompt;
+			
+			console.log(`[OllamaAutocoder Debug] provideCompletionItems - prompt length: ${prompt.length}, completeInput length: ${completeInput.length}, preview max tokens: ${responsePreviewMaxTokens}`);
 
 			const response_preview = await axios.post(apiEndpoint, {
 				model: apiModel, // Set via settings or "Ollama Autocoder: Select Ollama Model" command
@@ -228,9 +249,7 @@ async function provideCompletionItems(document: vscode.TextDocument, position: v
 				raw: true,
 				options: {
 					num_predict: responsePreviewMaxTokens, // reduced compute max
-					temperature: apiTemperature,
-					stop: ['\n', '```'],
-					num_ctx: Math.min(completeInput.length, promptWindowSize) // Assumes absolute worst case of 1 char = 1 token
+					temperature: apiTemperature
 				}
 			}, {
 				cancelToken: new axios.CancelToken((c) => {
@@ -314,12 +333,7 @@ function activate(context: vscode.ExtensionContext) {
 		}
 	);
 
-	// Add the commands & completion provider to the context
-	try {
-		context.subscriptions.push(completionProvider);
-		context.subscriptions.push(externalAutocompleteCommand);
-		context.subscriptions.push(externalSetBearerCommand);
-
+	// Define selectModelCommand before try block
 		const selectModelCommand = vscode.commands.registerCommand(
 			"ollama-autocoder.selectModel",
 			async () => {
@@ -332,24 +346,57 @@ function activate(context: vscode.ExtensionContext) {
 					placeHolder: "Select an Ollama model to switch to"
 				});
 				if (selected) {
-					await VSConfig.update("model", selected, vscode.ConfigurationTarget.Global);
-					updateVSConfig();
-					vscode.window.showInformationMessage(`Switched to model: ${selected}`);
+					const scopes = [
+						{ label: 'Global (all projects)', target: vscode.ConfigurationTarget.Global },
+						{ label: 'Workspace (current project)', target: vscode.ConfigurationTarget.Workspace }
+					];
+					const scopePick = await vscode.window.showQuickPick(scopes, {
+						placeHolder: "Choose config scope",
+						canPickMany: false
+					});
+					if (scopePick) {
+						await VSConfig.update("model", selected, scopePick.target);
+						// Validate model
+						try {
+							const testEndpoint = apiEndpoint;
+							await axios.post(testEndpoint, {
+								model: selected,
+								prompt: 'test',
+								stream: false,
+								options: { num_predict: 1 }
+							}, { timeout: 30000 });
+							vscode.window.showInformationMessage(`✅ Switched to ${selected} (${scopePick.label})`);
+						} catch (err: any) {
+							vscode.window.showWarningMessage(`⚠️ Switched to ${selected} (${scopePick.label}), validation failed: ${err.message}`);
+						}
+						updateVSConfig();
+					}
 				}
 			}
 		);
-		context.subscriptions.push(selectModelCommand);
+
+	// Add the commands & completion provider to the context
+		try {
+			context.subscriptions.push(completionProvider);
+			context.subscriptions.push(externalAutocompleteCommand);
+			context.subscriptions.push(externalSetBearerCommand);
+			context.subscriptions.push(selectModelCommand);
+
+			statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, -10000);
+			context.subscriptions.push(statusBarItem);
+
+			updateStatusBar();
+		} catch (err) {
+			handleError(err);
+		}
+
 		context.subscriptions.push(bearerSetChangeEvent);
-	} catch (err) {
-		handleError(err);
 	}
 
-}
-
-// This method is called when extension is deactivated
 function deactivate() { }
 
 module.exports = {
 	activate,
 	deactivate,
 };
+

@@ -11,8 +11,6 @@
 - Ollama 必须安装设置中指定的 \`model\`。当前默认是 \`qwen2.5-coder:7b\`。
 - \`prompt window size\`（提示窗口大小）应与模型的最大上下文窗口对齐。
 
-## 安装与开发构建 (Installation &amp; Build)
-
 ### 使用扩展
 1. 从 VS Code Marketplace 或 GitHub Releases 下载 .vsix 文件。
 2. 在 VS Code 中：Extensions > ... > Install from VSIX...
@@ -61,7 +59,6 @@ vsce package    # 打包生成 .vsix 文件
 
 **使用提示**：
 - **按空格激活，Enter 写入代码**。
-- 命令 "Autocomplete with Ollama" 每次调用独立（编写代码过程中不关闭、不需重新激活）；模型切换独立进行。
 
 ## 注意事项 (Notes)
 
