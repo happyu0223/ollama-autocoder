@@ -252,6 +252,10 @@ async function autocompleteCommand(textEditor: vscode.TextEditor, cancellationTo
 	const document = textEditor.document;
 	const position = textEditor.selection.active;
 
+	// Refresh config to get latest model
+	updateVSConfig();
+	console.log(`[OllamaAutocoder] autocompleteCommand - using model: ${apiModel}`);
+
 	// Get the current prompt
 	let prompt = document.getText(new vscode.Range(document.lineAt(0).range.start, position));
 	prompt = prompt.substring(Math.max(0, prompt.length - promptWindowSize), prompt.length);
@@ -403,6 +407,9 @@ async function autocompleteCommand(textEditor: vscode.TextEditor, cancellationTo
 
 // Completion item provider callback for activate
 async function provideCompletionItems(document: vscode.TextDocument, position: vscode.Position, cancellationToken: vscode.CancellationToken) {
+	// Refresh config to get latest model
+	updateVSConfig();
+	console.log(`[OllamaAutocoder] provideCompletionItems - using model: ${apiModel}`);
 
 	// Create a completion item
 	const item = new vscode.CompletionItem("Autocomplete with Ollama");
@@ -633,6 +640,8 @@ function activate(context: vscode.ExtensionContext) {
 					
 					if (success) {
 						vscode.window.showInformationMessage(`✅ Switched to ${selected}`);
+						// 切换成功后立即更新状态栏
+						updateStatusBar();
 					} else {
 						vscode.window.showErrorMessage(`❌ Failed to switch to ${selected}`);
 					}
