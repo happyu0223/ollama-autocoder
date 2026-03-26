@@ -1,6 +1,6 @@
 {
-	"name": "ollama-autocoder",
-	"displayName": "Ollama Autocoder",
+	"name": "ollama-Happycoder",
+	"displayName": "Ollama Happy Autocoder",
 	"description": "A simple to use Ollama autocompletion engine with options exposed and streaming functionality",
 	"version": "0.1.1",
 	"icon": "icon.png",
@@ -59,8 +59,8 @@
 				},
 				"ollama-autocoder.model": {
 					"type": "string",
-					"default": "qwen2.5-coder:latest",
-					"description": "The model to use for generating completions"
+					"default": "qwen2.5-coder:7b",
+"description":"Model name (e.g., qwen2.5-coder:7b). Use command 'Ollama Autocoder: Select Ollama Model' to pick dynamically from ollama list."
 				},
 				"ollama-autocoder.message header": {
 					"type": "string",
@@ -118,7 +118,12 @@
 			{
 				"command": "ollama-autocoder.setBearerToken",
 				"title": "Set Ollama API Bearer Token"
+			},
+			{
+				"command": "ollama-autocoder.selectModel",
+				"title": "Select Ollama Model"
 			}
+
 		]
 	},
 	"scripts": {

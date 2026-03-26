@@ -2,6 +2,8 @@
 
 import * as vscode from "vscode";
 import axios from "axios";
+import * as cp from "child_process";
+import { promisify } from "util";
 
 let VSConfig: vscode.WorkspaceConfiguration;
 let apiEndpoint: string;
@@ -16,6 +18,18 @@ let responsePreview: boolean | undefined;
 let responsePreviewMaxTokens: number;
 let responsePreviewDelay: number;
 let continueInline: boolean | undefined;
+
+async function getOllamaModels(): Promise<string[]> {
+	try {
+		const execAsync = promisify(cp.exec);
+		const { stdout } = await execAsync("ollama list");
+		const lines = stdout.trim().split("\n").slice(1); // Skip header
+		return lines.map(line => line.split(/\s+/)[0].trim()).filter(Boolean);
+	} catch (error: any) {
+		vscode.window.showErrorMessage(`Failed to fetch Ollama models: ${error.message}`);
+		return [];
+	}
+}
 
 function updateVSConfig() {
 	VSConfig = vscode.workspace.getConfiguration("ollama-autocoder");
@@ -97,7 +111,7 @@ async function autocompleteCommand(textEditor: vscode.TextEditor, cancellationTo
 
 				// Make a request to the ollama.ai REST API
 				const response = await axios.post(apiEndpoint, {
-					model: apiModel, // Change this to the model you want to use
+					model: apiModel, // Set via settings or "Ollama Autocoder: Select Ollama Model" command
 					prompt: completeInput,
 					stream: true,
 					raw: true,
@@ -208,7 +222,7 @@ async function provideCompletionItems(document: vscode.TextDocument, position: v
 			const completeInput = messageHeaderSub(document) + prompt;
 
 			const response_preview = await axios.post(apiEndpoint, {
-				model: apiModel, // Change this to the model you want to use
+				model: apiModel, // Set via settings or "Ollama Autocoder: Select Ollama Model" command
 				prompt: completeInput,
 				stream: false,
 				raw: true,
@@ -305,6 +319,26 @@ function activate(context: vscode.ExtensionContext) {
 		context.subscriptions.push(completionProvider);
 		context.subscriptions.push(externalAutocompleteCommand);
 		context.subscriptions.push(externalSetBearerCommand);
+
+		const selectModelCommand = vscode.commands.registerCommand(
+			"ollama-autocoder.selectModel",
+			async () => {
+				const models = await getOllamaModels();
+				if (models.length === 0) {
+					vscode.window.showErrorMessage("No Ollama models found. Ensure Ollama is running and try again.");
+					return;
+				}
+				const selected = await vscode.window.showQuickPick(models, {
+					placeHolder: "Select an Ollama model to switch to"
+				});
+				if (selected) {
+					await VSConfig.update("model", selected, vscode.ConfigurationTarget.Global);
+					updateVSConfig();
+					vscode.window.showInformationMessage(`Switched to model: ${selected}`);
+				}
+			}
+		);
+		context.subscriptions.push(selectModelCommand);
 		context.subscriptions.push(bearerSetChangeEvent);
 	} catch (err) {
 		handleError(err);
